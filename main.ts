@@ -76,6 +76,15 @@ async function waitForDone(): Promise<void> {
   }
 }
 
+// A forge that exits mid-trial scores 0, so a stray exception from one request (a socket reset inside a
+// pack stream, say) is logged and the process keeps serving the rest of the suite.
+process.on('uncaughtException', (err: unknown) => {
+  process.stderr.write(`[forge] uncaught: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
+});
+process.on('unhandledRejection', (reason: unknown) => {
+  process.stderr.write(`[forge] unhandled rejection: ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}\n`);
+});
+
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
   const server = createApp();

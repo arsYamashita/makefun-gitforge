@@ -1,49 +1,67 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
-//
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
+// The forge's HTTP server: one process serving git smart HTTP, REST v3, GraphQL v4 and MCP from one
+// in-memory store (src/store.ts). This file only routes; each surface lives in its own module.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-
-const JSON_TYPE = 'application/json; charset=utf-8';
-
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
-}
+import { HttpError, sendJson } from './src/http.ts';
+import { handleGit } from './src/git/smart.ts';
+import { handleRest } from './src/rest.ts';
+import { handleGraphql } from './src/graphql/index.ts';
+import { handleMcp } from './src/mcp.ts';
 
 /** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
+function urlOf(req: IncomingMessage): URL {
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    return new URL(req.url ?? '/', 'http://entry');
   } catch {
-    return '/';
+    return new URL('http://entry/');
   }
+}
+
+async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const url = urlOf(req);
+  const path = url.pathname;
+  const method = req.method ?? 'GET';
+
+  if (method === 'GET' && path === '/healthz') {
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+  if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+    await handleRest(req, res, url);
+    return;
+  }
+  if (path === '/api/graphql' || path === '/api/graphql/' || path === '/graphql') {
+    await handleGraphql(req, res, url);
+    return;
+  }
+  if (path === '/mcp' || path === '/mcp/') {
+    await handleMcp(req, res, url);
+    return;
+  }
+  if (/^\/[^/]+\/[^/]+\.git(\/|$)/.test(path) || /^\/[^/]+\/[^/]+\/(info\/refs|git-upload-pack|git-receive-pack)$/.test(path)) {
+    await handleGit(req, res, url);
+    return;
+  }
+  sendJson(res, 404, { message: 'Not Found', documentation_url: 'https://docs.github.com/rest' });
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
-    const method = req.method ?? 'GET';
-
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
-
-    // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
+  const server = createServer((req, res) => {
+    route(req, res).catch((err: unknown) => {
+      if (res.headersSent) {
+        res.destroy();
+        return;
+      }
+      if (err instanceof HttpError) {
+        sendJson(res, err.status, { message: err.message, ...err.extra });
+        return;
+      }
+      process.stderr.write(`[forge] ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
+      sendJson(res, 500, { message: 'Internal Server Error' });
+    });
   });
+  server.keepAliveTimeout = 65_000;
+  server.headersTimeout = 66_000;
+  return server;
 }

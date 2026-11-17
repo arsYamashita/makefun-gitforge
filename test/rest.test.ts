@@ -161,3 +161,30 @@ test('HTTP: contents, branches and pull requests (needs the git layer)', { skip:
     server.close();
   }
 });
+
+test('HTTP: creating a ref over an existing tag that points at a blob is refused; refs/ branch names stay under refs/heads', { skip: !gitReady }, async () => {
+  const server = createApp();
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const owner = store.viewer.login;
+    await call(base, 'POST', '/user/repos', { name: 'ref-edge', auto_init: true });
+    const p = `/repos/${owner}/ref-edge`;
+    const repo = requireRepo(owner, 'ref-edge');
+    const blob = git.writeObject(repo, 'blob', Buffer.from('payload'));
+    repo.git.refs.set('refs/tags/blobtag', blob);
+    const clash = await call(base, 'POST', `${p}/git/refs`, { ref: 'refs/tags/blobtag', sha: repo.git.refs.get('refs/heads/main') });
+    assert.equal(clash.status, 422);
+    assert.equal(repo.git.refs.get('refs/tags/blobtag'), blob);
+
+    const tip = repo.git.refs.get('refs/heads/main')!;
+    assert.equal((await call(base, 'POST', `${p}/git/refs`, { ref: 'refs/heads/refs/topic', sha: tip })).status, 201);
+    const put = await call(base, 'PUT', `${p}/contents/t.txt`, { message: 'm', content: Buffer.from('x').toString('base64'), branch: 'refs/topic' });
+    assert.equal(put.status, 201);
+    assert.equal(repo.git.refs.get('refs/heads/refs/topic'), put.json.commit.sha);
+    assert.equal(repo.git.refs.has('refs/topic'), false);
+    assert.equal((await call(base, 'GET', `${p}/branches/refs/topic`)).status, 200);
+  } finally {
+    server.close();
+  }
+});

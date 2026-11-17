@@ -195,7 +195,8 @@ export function commitChange(
   repo: Repo,
   input: { branch: string; path: string; content: Buffer | null; message: string },
 ): { commitSha: string; blobSha: string | null } {
-  const ref = input.branch.startsWith('refs/') ? input.branch : `refs/heads/${input.branch}`;
+  // API branch names are bare: `refs/topic` is the branch refs/heads/refs/topic.
+  const ref = `refs/heads/${input.branch}`;
   const parent = repo.git.refs.get(ref);
   const parentInfo = parent === undefined ? undefined : commitInfo(repo, parent);
   const segments = input.path.split('/').filter((segment) => segment !== '');
@@ -557,7 +558,7 @@ function merge3(repo: Repo, base: string | undefined, ours: string | undefined, 
 }
 
 function mergeTrees(repo: Repo, baseBranch: string, headSha: string, write: boolean): { tree: string | undefined; tip: string | undefined } | typeof CONFLICT {
-  const tip = resolveRef(repo, baseBranch);
+  const tip = resolveRef(repo, `refs/heads/${baseBranch}`);
   const head = commitInfo(repo, headSha);
   if (head === undefined) return CONFLICT;
   if (tip === undefined) return { tree: head.tree, tip: undefined };
@@ -582,8 +583,7 @@ export function squashMerge(
     'commit',
     serializeCommit({ tree, parents: merged.tip === undefined ? [] : [merged.tip], author: who, committer: who, message: withNewline(input.message) }),
   );
-  const ref = input.baseBranch.startsWith('refs/') ? input.baseBranch : `refs/heads/${input.baseBranch}`;
-  repo.git.refs.set(ref, sha);
+  repo.git.refs.set(`refs/heads/${input.baseBranch}`, sha);
   return { ok: true, sha };
 }
 

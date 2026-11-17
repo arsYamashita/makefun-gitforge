@@ -4,7 +4,7 @@ import { gunzipSync } from 'node:zlib';
 import type { Repo } from '../store.ts';
 import { store } from '../store.ts';
 import { HttpError, MAX_BODY_BYTES } from '../http.ts';
-import { ZERO_SHA, commitOf, isSha } from './objects.ts';
+import { ZERO_SHA, commitOf, isSha, parseTagTarget, treeOf } from './objects.ts';
 import { PackError, readPack } from './pack.ts';
 import { FLUSH, lineOf, pkt, readPackets, sideband } from './pktline.ts';
 import { isAncestor, peelObject } from './repo.ts';
@@ -53,20 +53,37 @@ export function receivePack(repo: Repo, rawBody: Buffer, gzipped: boolean): Buff
   const pack = body.subarray(next);
   const lines: string[] = [];
   let unpackError: string | null = null;
+  let incomplete = false;
   if (pack.length > 0) {
+    const fresh: string[] = [];
     try {
       for (const object of readPack(Buffer.from(pack), (sha) => repo.git.objects.get(sha))) {
-        if (!repo.git.objects.has(object.sha)) repo.git.objects.set(object.sha, { type: object.type, body: object.body });
+        if (!repo.git.objects.has(object.sha)) {
+          repo.git.objects.set(object.sha, { type: object.type, body: object.body });
+          fresh.push(object.sha);
+        }
       }
     } catch (err) {
       unpackError = err instanceof PackError ? err.message : 'unpack failed';
     }
+    // Only the objects this push added need checking; stored ones were checked when they arrived.
+    if (unpackError === null && !isConnected(repo, fresh)) {
+      incomplete = true;
+      for (const sha of fresh) repo.git.objects.delete(sha);
+    }
   }
   lines.push(unpackError === null ? 'unpack ok' : `unpack ${unpackError}`);
 
+  const refCounts = new Map<string, number>();
+  for (const command of commands) refCounts.set(command.ref, (refCounts.get(command.ref) ?? 0) + 1);
+
   let changed = false;
   for (const command of commands) {
-    const verdict = unpackError !== null ? 'unpacker error' : applyCommand(repo, command);
+    let verdict: string | null;
+    if (unpackError !== null) verdict = 'unpacker error';
+    else if ((refCounts.get(command.ref) ?? 0) > 1) verdict = 'duplicate ref';
+    else if (incomplete && command.newSha !== ZERO_SHA) verdict = 'missing necessary objects';
+    else verdict = applyCommand(repo, command);
     if (verdict === null) {
       lines.push(`ok ${command.ref}`);
       changed = true;
@@ -92,7 +109,7 @@ function applyCommand(repo: Repo, command: Command): string | null {
   const current = git.refs.get(ref);
   if (newSha === ZERO_SHA) {
     if (current === undefined) return 'does not exist';
-    if (oldSha !== ZERO_SHA && oldSha !== current) return 'stale info';
+    if (oldSha !== current) return 'stale info';
     if (ref === git.head) return 'deletion of the current branch prohibited';
     git.refs.delete(ref);
     return null;
@@ -123,6 +140,26 @@ function applyCommand(repo: Repo, command: Command): string | null {
   git.refs.set(ref, newSha);
   refreshPulls(repo, ref, newSha);
   return null;
+}
+
+/** True when every object the freshly stored ones point at is present (gitlinks excepted). */
+function isConnected(repo: Repo, fresh: readonly string[]): boolean {
+  const objects = repo.git.objects;
+  for (const sha of fresh) {
+    const object = objects.get(sha);
+    if (object === undefined) continue;
+    if (object.type === 'commit') {
+      const info = commitOf(object);
+      if (!objects.has(info.tree) || info.parents.some((parent) => !objects.has(parent))) return false;
+    } else if (object.type === 'tree') {
+      for (const entry of treeOf(object)) {
+        if (entry.mode !== '160000' && !objects.has(entry.sha)) return false;
+      }
+    } else if (object.type === 'tag') {
+      if (!objects.has(parseTagTarget(object.body).object)) return false;
+    }
+  }
+  return true;
 }
 
 function parseCommitCached(repo: Repo, sha: string) {

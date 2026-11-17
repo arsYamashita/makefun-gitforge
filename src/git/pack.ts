@@ -137,34 +137,45 @@ export function readPack(pack: Buffer, lookup: (sha: string) => GitObject | unde
   const byOffset = new Map<number, { type: GitObjectType; body: Buffer }>();
   const bySha = new Map<string, { type: GitObjectType; body: Buffer }>();
   const result = new Map<string, PackedObject>();
+  // Deltas whose base is not known yet wait under the base's offset ("o:") or sha ("s:").
+  const waiting = new Map<string, RawEntry[]>();
+  const ready: Array<{ raw: RawEntry; base: { type: GitObjectType; body: Buffer } }> = [];
   const settle = (raw: RawEntry, type: GitObjectType, body: Buffer): void => {
     const sha = hashObject(type, body);
     const resolved = { type, body };
     byOffset.set(raw.offset, resolved);
     bySha.set(sha, resolved);
     if (!result.has(sha)) result.set(sha, { sha, type, body });
+    for (const key of [`o:${raw.offset}`, `s:${sha}`]) {
+      const woken = waiting.get(key);
+      if (woken === undefined) continue;
+      waiting.delete(key);
+      for (const delta of woken) ready.push({ raw: delta, base: resolved });
+    }
   };
-  let pending: RawEntry[] = [];
+  const deltas: RawEntry[] = [];
   for (const raw of raws) {
     const type = TYPE_BY_CODE[raw.code];
     if (type !== undefined) settle(raw, type, raw.data);
-    else pending.push(raw);
+    else deltas.push(raw);
   }
-  while (pending.length > 0) {
-    const next: RawEntry[] = [];
-    for (const raw of pending) {
-      let base: { type: GitObjectType; body: Buffer } | undefined;
-      if (raw.code === 6) base = byOffset.get(raw.baseOffset!);
-      else base = bySha.get(raw.baseSha!) ?? lookup(raw.baseSha!);
-      if (base === undefined) {
-        next.push(raw);
-        continue;
-      }
-      settle(raw, base.type, applyDelta(base.body, raw.data));
+  for (const raw of deltas) {
+    const base = raw.code === 6 ? byOffset.get(raw.baseOffset!) : (bySha.get(raw.baseSha!) ?? lookup(raw.baseSha!));
+    if (base !== undefined) {
+      ready.push({ raw, base });
+      continue;
     }
-    if (next.length === pending.length) throw new PackError('a delta names a base that is not available');
-    pending = next;
+    const key = raw.code === 6 ? `o:${raw.baseOffset!}` : `s:${raw.baseSha!}`;
+    const list = waiting.get(key);
+    if (list === undefined) waiting.set(key, [raw]);
+    else list.push(raw);
   }
+  // Each delta is applied once, as soon as its base is known.
+  for (let next = 0; next < ready.length; next += 1) {
+    const { raw, base } = ready[next];
+    settle(raw, base.type, applyDelta(base.body, raw.data));
+  }
+  if (waiting.size > 0) throw new PackError('a delta names a base that is not available');
   return [...result.values()];
 }
 

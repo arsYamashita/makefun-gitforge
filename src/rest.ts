@@ -379,7 +379,7 @@ function commitsRoute(res: ServerResponse, url: URL, method: string, s: string[]
   if (method !== 'GET') throw notFound();
   if (s.length >= 2) {
     const ref = s.slice(1).map(decode).join('/');
-    const sha = git.resolveRef(repo, ref) ?? git.resolveRef(repo, `refs/heads/${ref}`);
+    const sha = git.resolveRef(repo, `refs/heads/${ref}`) ?? git.resolveRef(repo, ref);
     if (sha === undefined) throw new HttpError(404, `No commit found for SHA: ${ref}`);
     const entry = git.listCommits(repo, sha, 1)[0];
     if (entry === undefined) throw notFound();
@@ -419,7 +419,7 @@ function gitRoute(res: ServerResponse, method: string, s: string[], body: Json, 
       const ref = body.ref;
       const sha = body.sha;
       if (typeof ref !== 'string' || !ref.startsWith('refs/') || typeof sha !== 'string' || sha === '') throw validation('Reference', 'ref', 'invalid');
-      if (git.resolveRef(repo, ref) !== undefined && repo.git.refs.has(ref)) throw new HttpError(422, 'Reference already exists');
+      if (repo.git.refs.has(ref)) throw new HttpError(422, 'Reference already exists');
       const target = git.readObject(repo, sha.toLowerCase());
       if (target === undefined || target.type !== 'commit') throw new HttpError(422, 'Object does not exist');
       git.updateRef(repo, ref, sha.toLowerCase());

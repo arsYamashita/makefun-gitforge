@@ -400,3 +400,104 @@ test('a pack entry that inflates past its declared size is refused', () => {
   const pack = Buffer.concat([unsigned, createHash('sha1').update(unsigned).digest()]);
   assert.throws(() => readPack(pack, () => undefined), PackError);
 });
+
+test('two commands for one ref in a push are both refused; other refs still apply', async () => {
+  const repo = freshRepo();
+  const c1 = makeCommit(repo, { 'a.txt': 'one\n' }, [], 'c1');
+  const c2 = makeCommit(repo, { 'a.txt': 'two\n' }, [c1.sha], 'c2');
+  const sibling = makeCommit(repo, { 'z.txt': 'z\n' }, [c1.sha], 'sibling');
+  const all = [...c1.objects, ...c2.objects, ...sibling.objects];
+  assert.deepEqual(reportOf(await post(repo, 'git-receive-pack', pushBody([[ZERO, c2.sha, 'refs/heads/side']], writePack(all)))), ['unpack ok', 'ok refs/heads/side']);
+  // delete then re-create at a commit that is not a descendant: must not slip through as two steps
+  const answer = reportOf(await post(repo, 'git-receive-pack', pushBody([
+    [c2.sha, ZERO, 'refs/heads/side'],
+    [ZERO, sibling.sha, 'refs/heads/side'],
+    [ZERO, c1.sha, 'refs/heads/other'],
+  ], null)));
+  assert.deepEqual(answer, ['unpack ok', 'ng refs/heads/side duplicate ref', 'ng refs/heads/side duplicate ref', 'ok refs/heads/other']);
+  assert.equal(repo.git.refs.get('refs/heads/side'), c2.sha);
+  assert.equal(repo.git.refs.get('refs/heads/other'), c1.sha);
+});
+
+test('a delete must name the ref current value, an all-zero old id is stale', async () => {
+  const repo = freshRepo();
+  const c1 = makeCommit(repo, { 'a.txt': 'one\n' }, [], 'c1');
+  await post(repo, 'git-receive-pack', pushBody([[ZERO, c1.sha, 'refs/heads/main'], [ZERO, c1.sha, 'refs/heads/side']], writePack(c1.objects)));
+  const answer = reportOf(await post(repo, 'git-receive-pack', pushBody([[ZERO, ZERO, 'refs/heads/side']], null)));
+  assert.deepEqual(answer, ['unpack ok', 'ng refs/heads/side stale info']);
+  assert.equal(repo.git.refs.get('refs/heads/side'), c1.sha);
+});
+
+test('a ref update whose pack leaves a tree entry or a tag target missing is refused and stores nothing', async () => {
+  const repo = freshRepo();
+  const c1 = makeCommit(repo, { 'a.txt': 'one\n' }, [], 'c1');
+  const withoutBlob = c1.objects.filter((o) => o.type !== 'blob');
+  const refused = reportOf(await post(repo, 'git-receive-pack', pushBody([[ZERO, c1.sha, 'refs/heads/main']], writePack(withoutBlob))));
+  assert.deepEqual(refused, ['unpack ok', 'ng refs/heads/main missing necessary objects']);
+  assert.equal(repo.git.refs.has('refs/heads/main'), false);
+  assert.equal(repo.git.objects.has(c1.sha), false);
+  // the same push with the blob works, and a gitlink entry needs no object
+  const ok = reportOf(await post(repo, 'git-receive-pack', pushBody([[ZERO, c1.sha, 'refs/heads/main']], writePack(c1.objects))));
+  assert.deepEqual(ok, ['unpack ok', 'ok refs/heads/main']);
+  const link = serializeTree([{ mode: '160000', name: 'sub', sha: '9'.repeat(40) }]);
+  const who = 'T <t@example.invalid> 1700000000 +0000';
+  const commit = serializeCommit({ tree: hashRaw('tree', link), parents: [], author: who, committer: who, message: 'link\n' });
+  const linked = reportOf(await post(repo, 'git-receive-pack', pushBody([[ZERO, hashRaw('commit', commit), 'refs/heads/link']], writePack([{ type: 'tree', body: link }, { type: 'commit', body: commit }]))));
+  assert.deepEqual(linked, ['unpack ok', 'ok refs/heads/link']);
+  const tag = Buffer.from(`object ${'8'.repeat(40)}\ntype commit\ntag t\ntagger ${who}\n\nm\n`);
+  const tagged = reportOf(await post(repo, 'git-receive-pack', pushBody([[ZERO, hashRaw('tag', tag), 'refs/tags/t']], writePack([{ type: 'tag', body: tag }]))));
+  assert.deepEqual(tagged, ['unpack ok', 'ng refs/tags/t missing necessary objects']);
+});
+
+test('branch names that start with refs/ map to refs/heads/refs/...', () => {
+  const repo = freshRepo();
+  const first = commitChange(repo, { branch: 'refs/topic', path: 'a.txt', content: text('one\n'), message: 'first' });
+  assert.equal(repo.git.refs.get('refs/heads/refs/topic'), first.commitSha);
+  assert.equal(repo.git.refs.has('refs/topic'), false);
+  commitChange(repo, { branch: 'main', path: 'a.txt', content: text('one\n'), message: 'm' });
+  const second = commitChange(repo, { branch: 'refs/topic', path: 'b.txt', content: text('b\n'), message: 'second' });
+  assert.deepEqual(parseCommit(readObject(repo, second.commitSha)!.body).parents, [first.commitSha]);
+  assert.equal(mergeable(repo, 'refs/topic', second.commitSha), true);
+  const merged = squashMerge(repo, { baseBranch: 'refs/topic', headSha: second.commitSha, message: 'merge' });
+  assert.equal(merged.ok, true);
+  assert.equal(repo.git.refs.get('refs/heads/refs/topic'), merged.ok ? merged.sha : '');
+  assert.equal(repo.git.refs.has('refs/topic'), false);
+});
+
+function varint(value: number): number[] {
+  const out: number[] = [];
+  let rest = value;
+  while (rest >= 128) {
+    out.push((rest & 0x7f) | 0x80);
+    rest = Math.floor(rest / 128);
+  }
+  out.push(rest);
+  return out;
+}
+
+test('a REF_DELTA chain listed in reverse dependency order resolves with one lookup per delta', () => {
+  const length = 300;
+  const bodies: Buffer[] = [text('a')];
+  for (let i = 1; i <= length; i += 1) bodies.push(Buffer.concat([bodies[i - 1], text(String.fromCharCode(97 + (i % 26)))]));
+  const entries: Buffer[] = [];
+  for (let i = length; i >= 1; i -= 1) {
+    const size = bodies[i - 1].length;
+    const delta = Buffer.from([...varint(size), ...varint(size + 1), 0xb0, size & 0xff, size >> 8, 1, bodies[i][size]]);
+    entries.push(Buffer.concat([packEntryHeader(7, delta.length), Buffer.from(hashRaw('blob', bodies[i - 1]), 'hex'), deflateSync(delta)]));
+  }
+  entries.push(Buffer.concat([packEntryHeader(3, 1), deflateSync(bodies[0])]));
+  const header = Buffer.alloc(12);
+  header.write('PACK', 0);
+  header.writeUInt32BE(2, 4);
+  header.writeUInt32BE(entries.length, 8);
+  const unsigned = Buffer.concat([header, ...entries]);
+  const pack = Buffer.concat([unsigned, createHash('sha1').update(unsigned).digest()]);
+  let lookups = 0;
+  const objects = readPack(pack, () => {
+    lookups += 1;
+    return undefined;
+  });
+  assert.equal(objects.length, length + 1);
+  assert.deepEqual(new Set(objects.map((o) => o.sha)), new Set(bodies.map((b) => hashRaw('blob', b))));
+  assert.ok(lookups <= length, `expected at most one lookup per delta, saw ${lookups}`);
+});

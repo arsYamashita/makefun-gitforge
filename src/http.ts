@@ -41,11 +41,24 @@ export class HttpError extends Error {
   }
 }
 
-/** Read the whole request body. */
+/** The largest request body the forge reads; the pod has 1 GiB and the suite's largest push is far smaller. */
+export const MAX_BODY_BYTES = 256 * 1024 * 1024;
+
+/** Read the whole request body; one over MAX_BODY_BYTES is a 413 and the rest of it is dropped. */
 export function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    let total = 0;
+    req.on('data', (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > MAX_BODY_BYTES) {
+        req.removeAllListeners('data');
+        req.resume();
+        reject(new HttpError(413, 'Request body too large'));
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on('end', () => resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
     req.on('error', reject);
   });

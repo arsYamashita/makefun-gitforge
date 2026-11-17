@@ -10,6 +10,9 @@ const CODE_BY_TYPE: Record<GitObjectType, number> = { commit: 1, tree: 2, blob: 
 
 export class PackError extends Error {}
 
+/** The largest object a pack may carry or a delta may build; well above anything the suite pushes, well below the 1 GiB pod. */
+export const MAX_OBJECT_BYTES = 128 * 1024 * 1024;
+
 export interface PackedObject {
   readonly sha: string;
   readonly type: GitObjectType;
@@ -34,15 +37,22 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
   const sourceSize = varint();
   const targetSize = varint();
   if (sourceSize !== base.length) throw new PackError('delta base size mismatch');
-  const out = Buffer.allocUnsafe(targetSize);
+  if (targetSize > MAX_OBJECT_BYTES) throw new PackError('delta target too large');
+  // Every byte of the result is written below (the size check at the end proves it), but a zeroed
+  // buffer keeps a malformed delta from ever exposing stale memory.
+  const out = Buffer.alloc(targetSize);
+  const param = (): number => {
+    if (pos >= delta.length) throw new PackError('truncated delta copy instruction');
+    return delta[pos++];
+  };
   let at = 0;
   while (pos < delta.length) {
     const op = delta[pos++];
     if (op & 0x80) {
       let offset = 0;
       let size = 0;
-      for (let i = 0; i < 4; i += 1) if (op & (1 << i)) offset += delta[pos++] * 2 ** (8 * i);
-      for (let i = 0; i < 3; i += 1) if (op & (0x10 << i)) size += delta[pos++] * 2 ** (8 * i);
+      for (let i = 0; i < 4; i += 1) if (op & (1 << i)) offset += param() * 2 ** (8 * i);
+      for (let i = 0; i < 3; i += 1) if (op & (0x10 << i)) size += param() * 2 ** (8 * i);
       if (size === 0) size = 0x10000;
       if (offset + size > base.length || at + size > targetSize) throw new PackError('delta copy out of range');
       base.copy(out, at, offset, offset + size);
@@ -111,9 +121,10 @@ export function readPack(pack: Buffer, lookup: (sha: string) => GitObject | unde
     } else if (TYPE_BY_CODE[code] === undefined) {
       throw new PackError(`bad object type ${code}`);
     }
+    if (size > MAX_OBJECT_BYTES) throw new PackError(`object at ${offset} is too large`);
     let inflated: { buffer: Buffer; engine: { bytesWritten: number } };
     try {
-      inflated = inflateSync(pack.subarray(pos, end), { info: true }) as unknown as typeof inflated;
+      inflated = inflateSync(pack.subarray(pos, end), { info: true, maxOutputLength: Math.max(size, 1) }) as unknown as typeof inflated;
     } catch (err) {
       throw new PackError(`object at ${offset} does not inflate: ${(err as Error).message}`);
     }

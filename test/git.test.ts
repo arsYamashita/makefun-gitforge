@@ -8,7 +8,7 @@ import { store } from '../src/store.ts';
 import type { Repo } from '../src/store.ts';
 import { handleGit } from '../src/git/smart.ts';
 import { FLUSH, pkt, readPackets, lineOf } from '../src/git/pktline.ts';
-import { readPack, writePack } from '../src/git/pack.ts';
+import { PackError, applyDelta, readPack, writePack } from '../src/git/pack.ts';
 import { serializeCommit, serializeTree, hashObject as hashRaw } from '../src/git/objects.ts';
 import {
   commitChange, diffCommits, hashObject, isAncestor, listBranches, listCommits, mergeBase, mergeable, parseCommit,
@@ -377,4 +377,26 @@ test('packs with OFS_DELTA and REF_DELTA entries resolve (thin bases come from t
   assert.throws(() => readPack(thin, () => undefined));
   const resolved = readPack(thin, (sha) => repo.git.objects.get(sha));
   assert.equal(resolved[0].body.toString(), target.toString());
+});
+
+test('a delta whose copy instruction is cut short is refused, never filled with stale bytes', () => {
+  // source size 1, target size 65536, then a copy op announcing an offset byte that is not there
+  const delta = Buffer.from([1, 0x80, 0x80, 4, 0x81]);
+  assert.throws(() => applyDelta(Buffer.from('a'), delta), PackError);
+  // a well-formed delta still applies: copy the whole 3-byte base, then insert "!"
+  const good = Buffer.from([3, 4, 0x90, 3, 1, 0x21]);
+  assert.equal(applyDelta(Buffer.from('abc'), good).toString(), 'abc!');
+});
+
+test('a pack entry that inflates past its declared size is refused', () => {
+  const body = Buffer.from('x'.repeat(64));
+  const header = Buffer.alloc(12);
+  header.write('PACK', 0);
+  header.writeUInt32BE(2, 4);
+  header.writeUInt32BE(1, 8);
+  // blob (type 3) declaring 4 bytes while its zlib stream holds 64
+  const entry = Buffer.concat([Buffer.from([0x34]), deflateSync(body)]);
+  const unsigned = Buffer.concat([header, entry]);
+  const pack = Buffer.concat([unsigned, createHash('sha1').update(unsigned).digest()]);
+  assert.throws(() => readPack(pack, () => undefined), PackError);
 });

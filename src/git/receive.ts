@@ -3,7 +3,7 @@
 import { gunzipSync } from 'node:zlib';
 import type { Repo } from '../store.ts';
 import { store } from '../store.ts';
-import { HttpError } from '../http.ts';
+import { HttpError, MAX_BODY_BYTES } from '../http.ts';
 import { ZERO_SHA, commitOf, isSha } from './objects.ts';
 import { PackError, readPack } from './pack.ts';
 import { FLUSH, lineOf, pkt, readPackets, sideband } from './pktline.ts';
@@ -27,7 +27,7 @@ export function receivePack(repo: Repo, rawBody: Buffer, gzipped: boolean): Buff
   let body = rawBody;
   if (gzipped) {
     try {
-      body = gunzipSync(rawBody);
+      body = gunzipSync(rawBody, { maxOutputLength: MAX_BODY_BYTES });
     } catch {
       throw new HttpError(400, 'bad gzip body');
     }

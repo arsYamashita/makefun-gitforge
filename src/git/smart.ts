@@ -3,7 +3,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { gunzipSync } from 'node:zlib';
-import { HttpError, nextRequestId, readBody, sendJson } from '../http.ts';
+import { HttpError, MAX_BODY_BYTES, nextRequestId, readBody, sendJson } from '../http.ts';
 import type { Repo } from '../store.ts';
 import { store } from '../store.ts';
 import { ZERO_SHA, isSha } from './objects.ts';
@@ -336,7 +336,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
       sendJson(res, 403, { message: 'The dumb HTTP protocol is not supported' });
       return;
     }
-    if ((service === 'git-receive-pack' || repo.private) && !authorizedForGit(req)) {
+    if (!authorizedForGit(req)) {
       denyAuth(res);
       return;
     }
@@ -349,7 +349,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
     return;
   }
   const service = endpoint;
-  if ((service === 'git-receive-pack' || repo.private) && !authorizedForGit(req)) {
+  if (!authorizedForGit(req)) {
     denyAuth(res);
     return;
   }
@@ -363,7 +363,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, url: 
     let body = raw;
     if (gzipped) {
       try {
-        body = gunzipSync(raw);
+        body = gunzipSync(raw, { maxOutputLength: MAX_BODY_BYTES });
       } catch {
         throw new HttpError(400, 'bad gzip body');
       }
